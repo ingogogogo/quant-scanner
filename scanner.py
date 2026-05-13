@@ -285,3 +285,24 @@ with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
         ws2.conditional_format('A3:N5000', {'type': 'formula', 'criteria': f'=$A3="{date_val}"', 'format': fmt})
 
 print(f"✅ 4주 라이브 파일 생성 완료!")
+
+# ==============================================================================
+# 📲 깃허브 자동화 (텔레그램 발송) 로직
+# ==============================================================================
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+CHAT_ID = os.environ.get('CHAT_ID')
+
+if TELEGRAM_TOKEN and CHAT_ID:
+    print("📲 텔레그램으로 엑셀 결과를 전송합니다...")
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    msg = f"🚀 [{today_str}] 4주 라이브 스캐너 분석 완료\n\n오늘의 대장주 판독 및 유동성 분석이 완료되었습니다. 첨부된 엑셀 파일을 확인하세요."
+    
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={'chat_id': CHAT_ID, 'text': msg})
+        with open(file_name, 'rb') as f:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument", data={'chat_id': CHAT_ID}, files={'document': f})
+        print("✅ 텔레그램 전송 완벽 성공!")
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 실패: {e}")
+else:
+    print("⚠️ 텔레그램 토큰(TELEGRAM_TOKEN)이나 챗 아이디(CHAT_ID)가 깃허브 Secrets에 등록되지 않았습니다!")
