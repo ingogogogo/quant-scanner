@@ -13,11 +13,10 @@ warnings.filterwarnings('ignore')
 print("🚀 [1년 마스터 스캐너] 누적 데이터 엔진 및 유동성 추적 시작...")
 
 # ==============================================================================
-# 0. 🔑 FRED 공식 API 설정 (결측치 강제 보정 로직 추가)
+# 0. 🔑 FRED 공식 API 설정 (결측치 강제 보정)
 # ==============================================================================
 FRED_API_KEY = '7f64d6681ff75721a1135aa0488c5f4b'
 try:
-    print("⏳ 거시 유동성(FRED) 데이터 다운로드 중...")
     fred = Fred(api_key=FRED_API_KEY)
     fred_start = (datetime.today() - timedelta(days=600)).strftime('%Y-%m-%d')
     fred_end = datetime.today().strftime('%Y-%m-%d')
@@ -26,12 +25,11 @@ try:
     wtregen = fred.get_series('WTREGEN', observation_start=fred_start, observation_end=fred_end)
     rrp = fred.get_series('RRPONTSYD', observation_start=fred_start, observation_end=fred_end)
     
+    # 빈칸을 가장 최근 데이터로 강력하게 채워 에러를 방지합니다.
     macro_df = pd.DataFrame({'WALCL': walcl, 'WTREGEN': wtregen, 'RRP': rrp})
-    # 🚨 [수정 완료] 수요일/일일 발표 주기가 달라서 생기는 빈칸을 가장 최근 데이터로 강력하게 채움
-    macro_df = macro_df.ffill().dropna()
-    print(f"✅ FRED 데이터 로딩 완벽 성공! (데이터 수: {len(macro_df)}일치)")
+    macro_df.index = pd.to_datetime(macro_df.index)
+    macro_df = macro_df.sort_index().ffill().dropna()
 except Exception as e:
-    print(f"❌ FRED 데이터 로딩 실패: {e}")
     macro_df = pd.DataFrame()
 
 # ==============================================================================
@@ -76,12 +74,12 @@ close_data = data['Close']
 vol_data = data['Volume']
 mkt_gspc = close_data['^GSPC']
 
-# 🚨 결과물 엑셀에는 딱 '최근 1년치(365일)'만 담기 위한 타겟 날짜 설정
-target_start_dt = datetime.today() - timedelta(days=365)
+# 🚨 [에러 해결] 시간대(Timezone) 충돌을 막기 위해 문자열 형태(YYYY-MM-DD)로 변환
+target_start_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
 all_trading_days = close_data.index.unique().sort_values()
 
 # ==============================================================================
-# 3. 전체 거래일 루프 (과거 데이터를 생략하지 않고 100% 누적 계산!)
+# 3. 전체 거래일 루프 (과거 데이터부터 누적하여 횟수를 완벽히 기록)
 # ==============================================================================
 summary_stats, all_caught_stocks = [], []
 ticker_cumulative_counts = {}
@@ -102,10 +100,8 @@ def get_mkt_data(d):
 
 for i, trade_date in enumerate(all_trading_days):
     date_str = trade_date.strftime('%Y-%m-%d')
-    if trade_date >= target_start_dt and (i % 20 == 0): 
-        print(f"  ... 🎯 [{date_str}] 타겟 거래일 종목 스캔 및 엑셀 기록 중 ...")
     
-    # [거시 유동성 계산 및 연속성 추적]
+    # [1. 거시 유동성 계산 및 연속성 추적]
     net_bal_str, net_str, streak_text = "-", "-", "-"
     fed_bal_str, gov_bal_str = "-", "-"
     current_state = "flat"
@@ -113,17 +109,15 @@ for i, trade_date in enumerate(all_trading_days):
     if not macro_df.empty:
         try:
             date_dt = pd.to_datetime(date_str)
-            idx = macro_df.index.get_indexer([date_dt], method='ffill')[0]
-            past_idx = macro_df.index.get_indexer([date_dt - timedelta(days=7)], method='ffill')[0]
+            idx = macro_df.index.get_indexer([date_dt], method='pad')[0]
+            past_idx = macro_df.index.get_indexer([date_dt - timedelta(days=7)], method='pad')[0]
             if idx != -1 and past_idx != -1:
                 f_B = macro_df['WALCL'].iloc[idx] / 1000
                 g_B = macro_df['WTREGEN'].iloc[idx] + macro_df['RRP'].iloc[idx]
                 net_B = f_B - g_B
                 net_change_B = (macro_df['WALCL'].iloc[idx] - macro_df['WALCL'].iloc[past_idx])/1000 + (macro_df['WTREGEN'].iloc[past_idx] + macro_df['RRP'].iloc[past_idx]) - (macro_df['WTREGEN'].iloc[idx] + macro_df['RRP'].iloc[idx])
                 
-                net_bal_str = f"${net_B:,.1f}B"
-                fed_bal_str = f"${f_B:,.1f}B"
-                gov_bal_str = f"${g_B:,.1f}B"
+                net_bal_str, fed_bal_str, gov_bal_str = f"${net_B:,.1f}B", f"${f_B:,.1f}B", f"${g_B:,.1f}B"
                 
                 if net_change_B > 5.0:
                     net_str, current_state = f"🔥증가 (+${net_change_B:,.1f}B)", "up"
@@ -138,103 +132,115 @@ for i, trade_date in enumerate(all_trading_days):
                     streak_counter, last_state = 1, current_state
                 
                 weeks = streak_counter // 5
-                if weeks >= 1:
-                    streak_text = f"{weeks}주 연속 {'증가' if current_state=='up' else '감소'}"
-                else:
-                    streak_text = "전환점"
+                if weeks >= 1: streak_text = f"{weeks}주 연속 {'증가' if current_state=='up' else '감소'}"
+                else: streak_text = "전환점"
         except: pass
 
-    # 🚨 [수정 완료] 과거 데이터도 '건너뛰기(Skip)' 없이 무조건 계산하여 누적 횟수를 정확히 보존합니다.
+    # 🚨 [조건 복구 완료] 원래 사용하시던 직관적인 변수명과 매매 수식을 그대로 가져왔습니다.
     day_portfolio = []
     for t in tickers:
         if t not in close_data.columns or t in ['^GSPC', '^RUT']: continue
         series = close_data[t].dropna()
         if date_str not in series.index: continue
-        s_upto = series.loc[:date_str]
-        if len(s_upto) < 100: continue
-        l3 = s_upto.index[-3:]
-        if len(l3) < 3: continue
+        series_upto = series.loc[:date_str]
+        if len(series_upto) < 100: continue
+        last_3_dates = series_upto.index[-3:]
+        if len(last_3_dates) < 3: continue
 
-        passes = True
-        fm = {}
-        for d in reversed(l3):
-            d_s = d.strftime('%Y-%m-%d')
-            s_d = series.loc[:d_s]
-            p = s_d.iloc[-1]
-            if not (p > s_d.tail(50).mean() and p > s_d.tail(100).mean()): passes = False; break
+        passes_3_days = True
+        final_metrics = {}
+        for d in reversed(last_3_dates):
+            d_str_loop = d.strftime('%Y-%m-%d')
+            s_upto_d = series.loc[:d_str_loop]
+            buy_price_d = s_upto_d.iloc[-1]
+
+            if not (buy_price_d > s_upto_d.tail(50).mean() and buy_price_d > s_upto_d.tail(100).mean()): passes_3_days = False; break
             
             try:
-                mr = (mkt_gspc.loc[:d_s].iloc[-1] / mkt_gspc.loc[:d_s].iloc[-2]) - 1
-                sr = (s_d.iloc[-1] / s_d.iloc[-2]) - 1
-            except: mr, sr = 0, 0
+                m_ret = (mkt_gspc.loc[:d_str_loop].iloc[-1] / mkt_gspc.loc[:d_str_loop].iloc[-2]) - 1
+                s_ret = (s_upto_d.iloc[-1] / s_upto_d.iloc[-2]) - 1
+            except: m_ret, s_ret = 0, 0
             
-            is_m = (mr > 0 and sr > (mr * 3) and sr > 0.025) or (mr <= 0 and sr > 0.03)
-            hp = s_d.loc[(d - timedelta(days=365)).strftime('%Y-%m-%d'):].max()
-            px = ((p / hp) - 1) * 100
-            if px > -2.0 or px < -20.0: passes = False; break
+            is_monster = (m_ret > 0 and s_ret > (m_ret * 3) and s_ret > 0.025) or (m_ret <= 0 and s_ret > 0.03)
+            high_price = s_upto_d.loc[(d - timedelta(days=365)).strftime('%Y-%m-%d'):].max()
+            prox = ((buy_price_d / high_price) - 1) * 100
             
-            v_d = vol_data[t].dropna().loc[:d_s]
-            av60 = v_d.tail(60).mean()
-            vr = v_d.tail(5).max() / av60 if av60 else 0
+            if prox > -2.0 or prox < -20.0: passes_3_days = False; break
             
-            m6, mv6, m1, mv1, bst, b1st = get_mkt_data(d)
-            r6 = s_d.loc[bst:].pct_change().dropna()
-            if len(r6) < 50: passes = False; break
+            v_upto_d = vol_data[t].dropna().loc[:d_str_loop]
+            avg_vol_60 = v_upto_d.tail(60).mean()
+            v_ratio = v_upto_d.tail(5).max() / avg_vol_60 if avg_vol_60 else 0
             
-            b6 = r6.cov(m6) / mv6 if mv6 else 0
-            b1 = s_d.loc[b1st:].pct_change().dropna().cov(m1) / mv1 if mv1 else 0
-            if b1 < 0.8: passes = False; break
+            m_6m, m_v_6m, m_1m, m_v_1m, b_st, b1_st = get_mkt_data(d)
+            ret_6m = s_upto_d.loc[b_st:].pct_change().dropna()
+            if len(ret_6m) < 50: passes_3_days = False; break
             
-            sec = any(s in str(ticker_info[t]['industry']) for s in ['Technology', 'Semiconductor', 'Software', 'Computer', 'Communication'])
-            if sec:
-                if b6 < 1.5: passes = False; break
-                if not is_m and vr < 1.1: passes = False; break
+            beta_6m = ret_6m.cov(m_6m) / m_v_6m if m_v_6m else 0
+            beta_1m = s_upto_d.loc[b1_st:].pct_change().dropna().cov(m_1m) / m_v_1m if m_v_1m else 0
+            
+            if beta_1m < 0.8: passes_3_days = False; break
+            
+            info = ticker_info.get(t, {'industry': 'Unknown'})
+            is_strong_sector = any(s in str(info['industry']) for s in ['Technology', 'Semiconductor', 'Software', 'Computer', 'Communication'])
+            
+            if is_strong_sector:
+                if beta_6m < 1.5: passes_3_days = False; break
+                if not is_monster and v_ratio < 1.1: passes_3_days = False; break
             else:
-                if b6 < 2.2: passes = False; break
-                if not is_m and vr < 1.8: passes = False; break
+                if beta_6m < 2.2: passes_3_days = False; break
+                if not is_monster and v_ratio < 1.8: passes_3_days = False; break
                 
-            if d == l3[-1]: fm = {'p': p, 'b1': b1, 'b6': b6, 'px': px, 'vr': vr, 'is_m': is_m}
+            if d == last_3_dates[-1]:
+                final_metrics = {'buy_price': buy_price_d, 'b1': beta_1m, 'b6': beta_6m, 'hp': prox, 'v_ratio': v_ratio, 'is_monster': is_monster}
 
-        if passes:
-            # ✅ 누적 포착 횟수 증가 (과거부터 스노우볼처럼 쌓임)
+        if passes_3_days:
+            # ✅ 누적 횟수 정상화
             ticker_cumulative_counts[t] = ticker_cumulative_counts.get(t, 0) + 1
-            cnt, b1, vr = ticker_cumulative_counts[t], fm['b1'], fm['vr']
+            cur_count = ticker_cumulative_counts[t]
+            b_1m = final_metrics['b1']
+            v_rat = final_metrics['v_ratio']
             
-            grade = ""
-            if cnt >= 19 and b1 >= 2.7: grade = "💎 초거대 대장주 (3개월 농사 종목)"
-            elif cnt <= 2 and vr > 2.0: grade = "⚠️ 설거지 회피 (거래량 과열, 매수 보류)"
-            elif cnt <= 2: grade = "🔥 1. 초기 포착 (수익률 158%~)"
-            elif cnt >= 10: grade = "🛡️ 2. 안전 제일주의 (수익률 65%~)"
-            else: grade = "🏆 3. 황금 밸런스 (승률 92% 이상 대장주!)"
+            ai_grade = ""
+            if cur_count >= 19 and b_1m >= 2.7: ai_grade = "💎 초거대 대장주 (3개월 농사 종목)"
+            elif cur_count <= 2 and v_rat > 2.0: ai_grade = "⚠️ 설거지 회피 (거래량 과열, 매수 보류)"
+            elif cur_count <= 2: ai_grade = "🔥 1. 초기 포착 (수익률 158%~)"
+            elif cur_count >= 10: ai_grade = "🛡️ 2. 안전 제일주의 (수익률 65%~)"
+            else: ai_grade = "🏆 3. 황금 밸런스 (승률 92% 이상 대장주!)"
             
-            stock_row = {
-                '포착일자': date_str, '티커': t, '누적 포착횟수': f"{cnt}회", 'AI 매매 등급': grade,
-                '상세 테마': ('🚀[초강세] ' if fm['is_m'] else '') + ticker_info[t]['industry'],
-                '소속 지수': ticker_info[t]['index'], '매수가': round(fm['p'], 2), '현재가': round(series.iloc[-1], 2),
-                '단기수익률(%)': round(((series.iloc[-1] / fm['p']) - 1) * 100, 2), '1M 베타': round(b1, 2), '6M 베타': round(fm['b6'], 2),
-                '전고점 대비(%)': round(fm['px'], 2), '최대거래량(5일)': round(vr, 2)
+            curr_price = series.iloc[-1]
+            stock_data = {
+                '포착일자': date_str, '티커': t, '누적 포착횟수': f"{cur_count}회", 'AI 매매 등급': ai_grade,
+                '상세 테마': ('🚀[초강세] ' if final_metrics['is_monster'] else '') + ticker_info[t]['industry'],
+                '소속 지수': ticker_info[t]['index'], '매수가': round(final_metrics['buy_price'], 2), '현재가': round(curr_price, 2),
+                '단기수익률(%)': round(((curr_price / final_metrics['buy_price']) - 1) * 100, 2), '1M 베타': round(b_1m, 2), '6M 베타': round(final_metrics['b6'], 2),
+                '전고점 대비(%)': round(final_metrics['hp'], 2), '최대거래량(5일)': round(v_rat, 2)
             }
-            # 일일 포트폴리오에는 항상 기록
-            day_portfolio.append(stock_row)
+            day_portfolio.append(stock_data)
             
-            # ✅ 결과 엑셀에는 '최근 1년 치' 데이터만 깔끔하게 저장
-            if trade_date >= target_start_dt:
-                all_caught_stocks.append(stock_row)
+            # 🚨 타겟 날짜(최근 1년)에 해당하는 종목만 엑셀 출력을 위해 보관
+            if date_str >= target_start_str:
+                all_caught_stocks.append(stock_data)
 
-    # [요약 통계 저장 - 최근 1년 치만 저장]
-    if trade_date >= target_start_dt:
-        sig = "❌ 매수 금지" if len(day_portfolio) >= 15 else "⚠️ 휩소 경계" if "❄️" in net_str and len(day_portfolio) >= 8 else "🎯 강력 매수" if "🔥" in net_str and 1 <= len(day_portfolio) <= 5 else "👀 개별주 장세" if len(day_portfolio) > 0 else "💤 신호 없음"
+    # [요약 통계 저장]
+    # 🚨 타겟 날짜(최근 1년)에 해당하는 요약본만 엑셀 출력을 위해 보관
+    if date_str >= target_start_str:
+        hit_count = len(day_portfolio)
+        sig = "❌ 매수 금지" if hit_count >= 15 else "⚠️ 휩소 경계" if "❄️" in net_str and hit_count >= 8 else "🎯 강력 매수" if "🔥" in net_str and 1 <= hit_count <= 5 else "👀 개별주 장세" if hit_count > 0 else "💤 신호 없음"
         sum_row = {
             '매수 날짜': date_str, '유동성 연속성': streak_text, '유동성 증감(7일)': net_str, 
             '총 유동성 잔고': net_bal_str, '전략 시그널': sig, 
-            '연준 잔고(WALCL)': fed_bal_str, '재무부 잔고(TGA+RRP)': gov_bal_str, '타격수': len(day_portfolio)
+            '연준 잔고(WALCL)': fed_bal_str, '재무부 잔고(TGA+RRP)': gov_bal_str, '타격수': hit_count
         }
-        if day_portfolio:
-            top_t, top_c = Counter([item['상세 테마'].replace('🚀[초강세] ', '') for item in day_portfolio]).most_common(1)[0]
-            sum_row.update({'주도 테마': f"{top_t} ({top_c})", '평균수익(%)': round(pd.DataFrame(day_portfolio)['단기수익률(%)'].mean(), 2)})
+        if hit_count > 0:
+            top_theme, top_count = Counter([item['상세 테마'].replace('🚀[초강세] ', '') for item in day_portfolio]).most_common(1)[0]
+            sum_row.update({'주도 테마': f"{top_theme} ({top_count})", '평균수익(%)': round(pd.DataFrame(day_portfolio)['단기수익률(%)'].mean(), 2)})
         else: 
             sum_row.update({'주도 테마': '-', '평균수익(%)': 0.0})
         summary_stats.append(sum_row)
+        
+        # 진행률을 화면에 출력
+        if len(summary_stats) % 20 == 0:
+            print(f"  ... 🎯 [{date_str}] 타겟 거래일 엑셀 기록 완료 ...")
 
 # ==============================================================================
 # 💾 엑셀 작성
@@ -292,7 +298,7 @@ with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
         fmt = wb.add_format({'bg_color': pastel_colors[k % len(pastel_colors)]})
         ws2.conditional_format('A3:N5000', {'type': 'formula', 'criteria': f'=$A3="{date_val}"', 'format': fmt})
 
-print(f"✅ 1년 백테스트 파일 생성 완료!")
+print(f"✅ 1년 백테스트 엑셀 파일 생성 완료!")
 
 # ==============================================================================
 # 📲 깃허브 자동화 (텔레그램 발송) 로직
@@ -303,7 +309,7 @@ CHAT_ID = os.environ.get('CHAT_ID')
 if TELEGRAM_TOKEN and CHAT_ID:
     print("📲 텔레그램으로 엑셀 결과를 전송합니다...")
     today_str = datetime.today().strftime('%Y-%m-%d')
-    msg = f"🚀 [{today_str}] 1년 마스터 스캐너 분석 결과\n\n오늘의 대장주 판독 및 유동성 분석이 완료되었습니다. 첨부된 엑셀 파일을 확인하세요."
+    msg = f"🚀 [{today_str}] 1년 마스터 스캐너 분석 완료\n\n오늘의 대장주 판독 및 유동성 분석이 완료되었습니다. 첨부된 엑셀 파일을 확인하세요."
     
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={'chat_id': CHAT_ID, 'text': msg})
@@ -313,4 +319,4 @@ if TELEGRAM_TOKEN and CHAT_ID:
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 실패: {e}")
 else:
-    print("⚠️ 텔레그램 토큰이 설정되지 않아 파일 전송은 생략합니다. (깃허브 세팅을 진행해 주세요!)")
+    print("⚠️ 텔레그램 토큰이 감지되지 않았습니다. (GitHub Actions 환경에서 자동 전송됩니다.)")
