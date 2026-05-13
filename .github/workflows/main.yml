@@ -2,26 +2,25 @@ name: Daily Quant Scanner (Telegram)
 
 on:
   schedule:
-    # 화~토요일 아침 7시 실행 (미국장 마감 후)
-    # 깃허브 서버는 영국 시간(UTC) 기준이라 한국보다 9시간 느립니다. (UTC 22시 = 한국 아침 7시)
     - cron: '0 19 * * 1-5'
-  workflow_dispatch: # 이 줄은 내가 원할 때 수동으로 버튼을 눌러 실행할 수 있게 해줍니다.
+  workflow_dispatch:
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
     steps:
       - name: 저장소 파일 가져오기
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 👈 여기를 v3에서 v4로 변경했습니다!
 
       - name: 파이썬 설치하기
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # 👈 여기를 v4에서 v5로 변경했습니다!
         with:
           python-version: '3.10'
 
       - name: 필요한 라이브러리 설치
         run: |
           pip install pandas yfinance requests fredapi xlsxwriter
+
       - name: 🚀 스캐너 실행 및 텔레그램 전송!
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
