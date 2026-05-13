@@ -10,21 +10,28 @@ from collections import Counter
 
 warnings.filterwarnings('ignore')
 
-print("🚀 [1년 백테스트 스캐너] 유동성 히스토리 추적 및 종목 스캔 시작...")
+print("🚀 [1년 마스터 스캐너] 누적 데이터 엔진 및 유동성 추적 시작...")
 
 # ==============================================================================
-# 0. 🔑 FRED 공식 API 설정 (과거 600일 데이터 확보)
+# 0. 🔑 FRED 공식 API 설정 (결측치 강제 보정 로직 추가)
 # ==============================================================================
 FRED_API_KEY = '7f64d6681ff75721a1135aa0488c5f4b'
 try:
+    print("⏳ 거시 유동성(FRED) 데이터 다운로드 중...")
     fred = Fred(api_key=FRED_API_KEY)
     fred_start = (datetime.today() - timedelta(days=600)).strftime('%Y-%m-%d')
     fred_end = datetime.today().strftime('%Y-%m-%d')
+    
     walcl = fred.get_series('WALCL', observation_start=fred_start, observation_end=fred_end)
     wtregen = fred.get_series('WTREGEN', observation_start=fred_start, observation_end=fred_end)
     rrp = fred.get_series('RRPONTSYD', observation_start=fred_start, observation_end=fred_end)
-    macro_df = pd.DataFrame({'WALCL': walcl, 'WTREGEN': wtregen, 'RRP': rrp}).ffill().dropna()
-except: 
+    
+    macro_df = pd.DataFrame({'WALCL': walcl, 'WTREGEN': wtregen, 'RRP': rrp})
+    # 🚨 [수정 완료] 수요일/일일 발표 주기가 달라서 생기는 빈칸을 가장 최근 데이터로 강력하게 채움
+    macro_df = macro_df.ffill().dropna()
+    print(f"✅ FRED 데이터 로딩 완벽 성공! (데이터 수: {len(macro_df)}일치)")
+except Exception as e:
+    print(f"❌ FRED 데이터 로딩 실패: {e}")
     macro_df = pd.DataFrame()
 
 # ==============================================================================
@@ -58,24 +65,23 @@ ticker_info = get_tickers()
 tickers = list(ticker_info.keys())
 
 # ==============================================================================
-# 2. 주가 데이터 다운로드 (진행률 표시 켬)
+# 2. 주가 데이터 다운로드
 # ==============================================================================
-# 1년 백테스트이므로 과거 600일부터 넉넉히 가져옵니다.
 start_history = (datetime.today() - timedelta(days=600)).strftime('%Y-%m-%d')
 end_history_safe = (datetime.today() + timedelta(days=1)).strftime('%Y-%m-%d')
-print(f"📥 주가 데이터 다운로드 중... (약 1~3분 소요)")
+print(f"📥 주가 데이터 다운로드 중... (진행률 확인, 약 1~3분 소요)")
 data = yf.download(tickers + ['^GSPC', '^RUT'], start=start_history, end=end_history_safe, progress=True)
 
 close_data = data['Close']
 vol_data = data['Volume']
 mkt_gspc = close_data['^GSPC']
 
-# 1년 백테스트 타겟 날짜 설정
+# 🚨 결과물 엑셀에는 딱 '최근 1년치(365일)'만 담기 위한 타겟 날짜 설정
 target_start_dt = datetime.today() - timedelta(days=365)
 all_trading_days = close_data.index.unique().sort_values()
 
 # ==============================================================================
-# 3. 전체 거래일 루프 
+# 3. 전체 거래일 루프 (과거 데이터를 생략하지 않고 100% 누적 계산!)
 # ==============================================================================
 summary_stats, all_caught_stocks = [], []
 ticker_cumulative_counts = {}
@@ -96,23 +102,28 @@ def get_mkt_data(d):
 
 for i, trade_date in enumerate(all_trading_days):
     date_str = trade_date.strftime('%Y-%m-%d')
+    if trade_date >= target_start_dt and (i % 20 == 0): 
+        print(f"  ... 🎯 [{date_str}] 타겟 거래일 종목 스캔 및 엑셀 기록 중 ...")
     
-    # [1. 거시 유동성 계산 및 연속성 추적 - 매일 빠르게 진행]
+    # [거시 유동성 계산 및 연속성 추적]
     net_bal_str, net_str, streak_text = "-", "-", "-"
     fed_bal_str, gov_bal_str = "-", "-"
     current_state = "flat"
     
     if not macro_df.empty:
         try:
-            idx = macro_df.index.get_indexer([pd.to_datetime(date_str)], method='pad')[0]
-            past_idx = macro_df.index.get_indexer([pd.to_datetime(date_str) - timedelta(days=7)], method='pad')[0]
+            date_dt = pd.to_datetime(date_str)
+            idx = macro_df.index.get_indexer([date_dt], method='ffill')[0]
+            past_idx = macro_df.index.get_indexer([date_dt - timedelta(days=7)], method='ffill')[0]
             if idx != -1 and past_idx != -1:
                 f_B = macro_df['WALCL'].iloc[idx] / 1000
                 g_B = macro_df['WTREGEN'].iloc[idx] + macro_df['RRP'].iloc[idx]
                 net_B = f_B - g_B
                 net_change_B = (macro_df['WALCL'].iloc[idx] - macro_df['WALCL'].iloc[past_idx])/1000 + (macro_df['WTREGEN'].iloc[past_idx] + macro_df['RRP'].iloc[past_idx]) - (macro_df['WTREGEN'].iloc[idx] + macro_df['RRP'].iloc[idx])
                 
-                net_bal_str, fed_bal_str, gov_bal_str = f"${net_B:,.1f}B", f"${f_B:,.1f}B", f"${g_B:,.1f}B"
+                net_bal_str = f"${net_B:,.1f}B"
+                fed_bal_str = f"${f_B:,.1f}B"
+                gov_bal_str = f"${g_B:,.1f}B"
                 
                 if net_change_B > 5.0:
                     net_str, current_state = f"🔥증가 (+${net_change_B:,.1f}B)", "up"
@@ -133,13 +144,7 @@ for i, trade_date in enumerate(all_trading_days):
                     streak_text = "전환점"
         except: pass
 
-    # 🚨 [속도 최적화] 타겟 날짜(최근 1년)가 아니면 무거운 종목 스캔 패스!
-    if trade_date < target_start_dt:
-        continue
-        
-    print(f"  ... 🎯 [{date_str}] 타겟 거래일 종목 스캔 중 ...")
-
-    # [2. 핵심 종목 필터링 로직]
+    # 🚨 [수정 완료] 과거 데이터도 '건너뛰기(Skip)' 없이 무조건 계산하여 누적 횟수를 정확히 보존합니다.
     day_portfolio = []
     for t in tickers:
         if t not in close_data.columns or t in ['^GSPC', '^RUT']: continue
@@ -191,6 +196,7 @@ for i, trade_date in enumerate(all_trading_days):
             if d == l3[-1]: fm = {'p': p, 'b1': b1, 'b6': b6, 'px': px, 'vr': vr, 'is_m': is_m}
 
         if passes:
+            # ✅ 누적 포착 횟수 증가 (과거부터 스노우볼처럼 쌓임)
             ticker_cumulative_counts[t] = ticker_cumulative_counts.get(t, 0) + 1
             cnt, b1, vr = ticker_cumulative_counts[t], fm['b1'], fm['vr']
             
@@ -208,22 +214,27 @@ for i, trade_date in enumerate(all_trading_days):
                 '단기수익률(%)': round(((series.iloc[-1] / fm['p']) - 1) * 100, 2), '1M 베타': round(b1, 2), '6M 베타': round(fm['b6'], 2),
                 '전고점 대비(%)': round(fm['px'], 2), '최대거래량(5일)': round(vr, 2)
             }
-            all_caught_stocks.append(stock_row)
+            # 일일 포트폴리오에는 항상 기록
             day_portfolio.append(stock_row)
+            
+            # ✅ 결과 엑셀에는 '최근 1년 치' 데이터만 깔끔하게 저장
+            if trade_date >= target_start_dt:
+                all_caught_stocks.append(stock_row)
 
-    # [요약 통계 저장]
-    sig = "❌ 매수 금지" if len(day_portfolio) >= 15 else "⚠️ 휩소 경계" if "❄️" in net_str and len(day_portfolio) >= 8 else "🎯 강력 매수" if "🔥" in net_str and 1 <= len(day_portfolio) <= 5 else "👀 개별주 장세" if len(day_portfolio) > 0 else "💤 신호 없음"
-    sum_row = {
-        '매수 날짜': date_str, '유동성 연속성': streak_text, '유동성 증감(7일)': net_str, 
-        '총 유동성 잔고': net_bal_str, '전략 시그널': sig, 
-        '연준 잔고(WALCL)': fed_bal_str, '재무부 잔고(TGA+RRP)': gov_bal_str, '타격수': len(day_portfolio)
-    }
-    if day_portfolio:
-        top_t, top_c = Counter([item['상세 테마'].replace('🚀[초강세] ', '') for item in day_portfolio]).most_common(1)[0]
-        sum_row.update({'주도 테마': f"{top_t} ({top_c})", '평균수익(%)': round(pd.DataFrame(day_portfolio)['단기수익률(%)'].mean(), 2)})
-    else: 
-        sum_row.update({'주도 테마': '-', '평균수익(%)': 0.0})
-    summary_stats.append(sum_row)
+    # [요약 통계 저장 - 최근 1년 치만 저장]
+    if trade_date >= target_start_dt:
+        sig = "❌ 매수 금지" if len(day_portfolio) >= 15 else "⚠️ 휩소 경계" if "❄️" in net_str and len(day_portfolio) >= 8 else "🎯 강력 매수" if "🔥" in net_str and 1 <= len(day_portfolio) <= 5 else "👀 개별주 장세" if len(day_portfolio) > 0 else "💤 신호 없음"
+        sum_row = {
+            '매수 날짜': date_str, '유동성 연속성': streak_text, '유동성 증감(7일)': net_str, 
+            '총 유동성 잔고': net_bal_str, '전략 시그널': sig, 
+            '연준 잔고(WALCL)': fed_bal_str, '재무부 잔고(TGA+RRP)': gov_bal_str, '타격수': len(day_portfolio)
+        }
+        if day_portfolio:
+            top_t, top_c = Counter([item['상세 테마'].replace('🚀[초강세] ', '') for item in day_portfolio]).most_common(1)[0]
+            sum_row.update({'주도 테마': f"{top_t} ({top_c})", '평균수익(%)': round(pd.DataFrame(day_portfolio)['단기수익률(%)'].mean(), 2)})
+        else: 
+            sum_row.update({'주도 테마': '-', '평균수익(%)': 0.0})
+        summary_stats.append(sum_row)
 
 # ==============================================================================
 # 💾 엑셀 작성
@@ -252,7 +263,6 @@ with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
     
     ws1.set_column('A:B', 15); ws1.set_column('C:C', 26); ws1.set_column('D:G', 20); ws1.set_column('H:K', 16)
     
-    # 요약 시트 서식
     f_red = wb.add_format({'font_color': '#FF0000', 'bold': True})
     f_blue = wb.add_format({'font_color': '#0000FF', 'bold': True})
     f_mblue = wb.add_format({'bg_color': '#00008B', 'font_color': '#FFFFFF', 'bold': True})
@@ -261,7 +271,6 @@ with pd.ExcelWriter(file_name, engine='xlsxwriter') as writer:
     ws1.conditional_format('C3:C5000', {'type': 'text', 'criteria': 'containing', 'value': '❄️', 'format': f_blue})
     ws1.conditional_format('B3:B5000', {'type': 'formula', 'criteria': 'OR(ISNUMBER(SEARCH("3주",B3)),ISNUMBER(SEARCH("4주",B3)),ISNUMBER(SEARCH("5주",B3)),ISNUMBER(SEARCH("6주",B3)))', 'format': f_mblue})
     
-    # 종목 시트 서식
     ws2.freeze_panes(2, 1)
     ws2.set_column('A:A', 14); ws2.set_column('B:C', 12); ws2.set_column('D:D', 45); ws2.set_column('E:E', 30); ws2.set_column('F:N', 12)
     
@@ -294,18 +303,14 @@ CHAT_ID = os.environ.get('CHAT_ID')
 if TELEGRAM_TOKEN and CHAT_ID:
     print("📲 텔레그램으로 엑셀 결과를 전송합니다...")
     today_str = datetime.today().strftime('%Y-%m-%d')
-    msg = f"🚀 [{today_str}] 1년 백테스트 스캐너 분석 결과\n\n오늘의 퀀트 스캐너(대장주 판독 및 유동성 분석) 파일이 완성되었습니다. 첨부 파일을 확인하세요."
+    msg = f"🚀 [{today_str}] 1년 마스터 스캐너 분석 결과\n\n오늘의 대장주 판독 및 유동성 분석이 완료되었습니다. 첨부된 엑셀 파일을 확인하세요."
     
     try:
-        # 메시지 전송
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={'chat_id': CHAT_ID, 'text': msg})
-        
-        # 파일 전송
         with open(file_name, 'rb') as f:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument", data={'chat_id': CHAT_ID}, files={'document': f})
-        
         print("✅ 텔레그램 전송 완벽 성공!")
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 실패: {e}")
 else:
-    print("⚠️ GitHub Secrets에 텔레그램 정보가 없어 텔레그램 전송은 생략합니다.")
+    print("⚠️ 텔레그램 토큰이 설정되지 않아 파일 전송은 생략합니다. (깃허브 세팅을 진행해 주세요!)")
